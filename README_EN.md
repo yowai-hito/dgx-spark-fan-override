@@ -12,7 +12,27 @@ Once installed, the module binds to `arm-ffa-17` and creates the following:
 ```text
 /sys/bus/arm_ffa/devices/arm-ffa-17/fan
 ```
-A request is sent each time `max` or `auto` is written to `fan`; reading this attribute returns `ready`, `max`, `auto`, or `error <errno>`. --------
+A request is sent each time `max`, `auto`, or an RPM value `0`–`13500` is written to `fan`; reading this attribute returns `ready`, `max`, `auto`, the RPM value, or `error <errno>`.
+
+### Custom Fan Curve
+
+A numeric value is written to the same high override slot as `max`, so it acts as an RPM **floor**: the EC automatic curve still applies above it, and a custom curve can only make the fans faster than the firmware would.
+
+```bash
+sudo nvfancontrol 6000      # fixed 6000 RPM floor
+sudo nvfancontrol curve     # run the curve from /etc/nvfancontrol.conf in the foreground
+```
+
+`/etc/nvfancontrol.conf` sets the steps (`TEMP:TARGET`, where TARGET is `auto`, `max`, or an RPM), the step-down hysteresis, the poll interval, and the temperature source (`thermal` zones, `nvidia-smi`, or a millidegree file path). The daemon writes only when the step changes. If no temperature can be read it fails safe to `max`, and it restores `auto` when stopped.
+
+Run it as a service (this stops `nvfancontrol.service`, and the reverse is also true):
+
+```bash
+sudo systemctl enable --now nvfancontrol-curve.service
+journalctl -u nvfancontrol-curve.service -f
+```
+
+--------
 
 ### Control Link
 

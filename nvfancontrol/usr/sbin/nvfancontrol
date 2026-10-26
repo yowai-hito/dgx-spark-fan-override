@@ -6,17 +6,41 @@ expected_uuid='884a63a0-3285-4120-83aa-eec008a0a546'
 ffa_device='/sys/bus/arm_ffa/devices/arm-ffa-17'
 fan_path="$ffa_device/fan"
 module='nvfancontrol'
+lock_file='/run/lock/nvfancontrol.lock'
+curve_lock_file='/run/lock/nvfancontrol-curve.lock'
+config_file='/etc/nvfancontrol.conf'
+full_rpm=13500
 
 usage() {
-    printf 'Usage: sudo nvfancontrol {max|auto|status|unload}\n' >&2
+    printf 'Usage: sudo nvfancontrol {max|auto|<rpm>|curve|status|unload}\n' >&2
     printf '  max      load the module if needed, then write max to the fan sysfs interface\n' >&2
     printf '  auto     load the module if needed, then write auto to the fan sysfs interface\n' >&2
+    printf '  <rpm>    load the module if needed, then set a fixed RPM floor (0-%s)\n' "$full_rpm" >&2
+    printf '  curve    run the temperature curve from %s until stopped, then restore auto\n' "$config_file" >&2
     printf '  status   show whether the module is loaded and read the fan interface\n' >&2
     printf '  unload   explicitly remove the module; the EC setting remains unchanged\n' >&2
 }
 
+# Normalizes a fan target to the form the sysfs attribute reports back:
+# "max", "auto", or a decimal RPM without leading zeros.
+normalize_target() {
+    case "$1" in
+        max|auto)
+            printf '%s' "$1"
+            ;;
+        ''|*[!0-9]*)
+            return 1
+            ;;
+        *)
+            [ "${#1}" -le 5 ] || return 1
+            [ "$((10#$1))" -le "$full_rpm" ] || return 1
+            printf '%s' "$((10#$1))"
+            ;;
+    esac
+}
+
 case "${1:-}" in
-    max|auto|status|unload)
+    status|unload|curve)
         action="$1"
         ;;
     -h|--help)
@@ -24,8 +48,10 @@ case "${1:-}" in
         exit 0
         ;;
     *)
-        usage
-        exit 2
+        if ! action="$(normalize_target "${1:-}")"; then
+            usage
+            exit 2
+        fi
         ;;
 esac
 
@@ -38,7 +64,15 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-exec 9>/run/lock/nvfancontrol.lock
+if [ "$action" = 'curve' ]; then
+    exec 8>"$curve_lock_file"
+    if ! flock -n 8; then
+        printf 'Another nvfancontrol curve daemon is already running.\n' >&2
+        exit 1
+    fi
+fi
+
+exec 9>"$lock_file"
 if ! flock -n 9; then
     printf 'Another nvfancontrol operation is already running.\n' >&2
     exit 1
@@ -142,17 +176,273 @@ if [ ! -w "$fan_path" ]; then
     exit 1
 fi
 
-if ! printf '%s\n' "$action" > "$fan_path"; then
-    printf 'The sysfs write failed; EC override state is unknown. Do not retry blindly.\n' >&2
-    printf 'Fan state: %s\n' "$(tr -d '\r\n' < "$fan_path")" >&2
+# Writes one normalized target and verifies the state the driver reports.
+write_fan() {
+    local target="$1"
+    local after
+
+    if ! printf '%s\n' "$target" > "$fan_path"; then
+        printf 'The sysfs write failed; EC override state is unknown. Do not retry blindly.\n' >&2
+        printf 'Fan state: %s\n' "$(tr -d '\r\n' < "$fan_path")" >&2
+        return 1
+    fi
+
+    after="$(tr -d '\r\n' < "$fan_path")"
+    if [ "$after" != "$target" ]; then
+        printf 'Unexpected fan state after write: expected %s, observed %s\n' \
+            "$target" "$after" >&2
+        return 1
+    fi
+}
+
+if [ "$action" != 'curve' ]; then
+    write_fan "$action" || exit 1
+    printf 'OK\n'
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Custom temperature curve daemon
+#
+# The EC high override slot is an RPM floor: the EC automatic curve still
+# applies above it. The daemon therefore can only make the fans spin faster
+# than the firmware would on its own, never slower.
+# ---------------------------------------------------------------------------
+
+interval=2
+hysteresis=5
+temp_source='thermal'
+curve='0:2000 40:3500 50:5500 58:6250 65:7000 70:9000 85:max'
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+# The configuration is parsed rather than sourced so that it can never execute
+# code as root.
+if [ -e "$config_file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="$(trim "${line%$'\r'}")"
+        [ -n "$line" ] || continue
+        case "$line" in
+            *=*)
+                ;;
+            *)
+                printf 'Invalid line in %s: %s\n' "$config_file" "$line" >&2
+                exit 1
+                ;;
+        esac
+        key="$(trim "${line%%=*}")"
+        value="$(trim "${line#*=}")"
+        value="${value#[\"\']}"
+        value="${value%[\"\']}"
+        case "$key" in
+            INTERVAL) interval="$value" ;;
+            HYSTERESIS) hysteresis="$value" ;;
+            TEMP_SOURCE) temp_source="$value" ;;
+            CURVE) curve="$value" ;;
+            *)
+                printf 'Unknown key in %s: %s\n' "$config_file" "$key" >&2
+                exit 1
+                ;;
+        esac
+    done < "$config_file"
+fi
+
+case "$interval" in
+    ''|*[!0-9]*|0)
+        printf 'INTERVAL must be a positive integer number of seconds: %s\n' "$interval" >&2
+        exit 1
+        ;;
+esac
+case "$hysteresis" in
+    ''|*[!0-9]*)
+        printf 'HYSTERESIS must be a non-negative integer in degrees C: %s\n' "$hysteresis" >&2
+        exit 1
+        ;;
+esac
+for source in $temp_source; do
+    case "$source" in
+        thermal|nvidia-smi|/*)
+            ;;
+        *)
+            printf 'TEMP_SOURCE entries must be thermal, nvidia-smi or an absolute path: %s\n' \
+                "$source" >&2
+            exit 1
+            ;;
+    esac
+done
+if [ -z "$(trim "$temp_source")" ]; then
+    printf 'TEMP_SOURCE is empty in %s\n' "$config_file" >&2
     exit 1
 fi
 
-after="$(tr -d '\r\n' < "$fan_path")"
-if [ "$after" != "$action" ]; then
-    printf 'Unexpected fan state after write: expected %s, observed %s\n' \
-        "$action" "$after" >&2
+curve_temps=()
+curve_targets=()
+for point in $curve; do
+    point_temp="${point%%:*}"
+    point_target="${point#*:}"
+    case "$point_temp" in
+        ''|*[!0-9]*)
+            printf 'Invalid curve point (expected TEMP:RPM): %s\n' "$point" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$point" = "$point_temp" ] ||
+            ! point_target="$(normalize_target "$point_target")"; then
+        printf 'Invalid curve target in %s (expected auto, max or 0-%s)\n' \
+            "$point" "$full_rpm" >&2
+        exit 1
+    fi
+    point_temp="$((10#$point_temp))"
+    if [ "${#curve_temps[@]}" -gt 0 ] &&
+            [ "$point_temp" -le "${curve_temps[-1]}" ]; then
+        printf 'Curve temperatures must be strictly increasing: %s\n' "$curve" >&2
+        exit 1
+    fi
+    curve_temps+=("$point_temp")
+    curve_targets+=("$point_target")
+done
+
+if [ "${#curve_temps[@]}" -eq 0 ]; then
+    printf 'CURVE is empty in %s\n' "$config_file" >&2
     exit 1
 fi
 
+# Prints the hottest reading in whole degrees C across all configured sources.
+read_temperature() {
+    local hottest=''
+    local source reading file
+
+    for source in $temp_source; do
+        case "$source" in
+            thermal)
+                for file in /sys/class/thermal/thermal_zone*/temp; do
+                    [ -r "$file" ] || continue
+                    reading="$(tr -d '\r\n' < "$file" 2>/dev/null)" || continue
+                    case "$reading" in
+                        ''|*[!0-9]*) continue ;;
+                    esac
+                    reading="$((10#$reading / 1000))"
+                    if [ -z "$hottest" ] || [ "$reading" -gt "$hottest" ]; then
+                        hottest="$reading"
+                    fi
+                done
+                ;;
+            nvidia-smi)
+                while IFS= read -r reading; do
+                    reading="$(trim "$reading")"
+                    case "$reading" in
+                        ''|*[!0-9]*) continue ;;
+                    esac
+                    if [ -z "$hottest" ] || [ "$reading" -gt "$hottest" ]; then
+                        hottest="$reading"
+                    fi
+                done < <(timeout 10 nvidia-smi --query-gpu=temperature.gpu \
+                    --format=csv,noheader,nounits 2>/dev/null || true)
+                ;;
+            /*)
+                # Any sysfs-style file reporting millidegrees C.
+                [ -r "$source" ] || continue
+                reading="$(tr -d '\r\n' < "$source" 2>/dev/null)" || continue
+                case "$reading" in
+                    ''|*[!0-9]*) continue ;;
+                esac
+                reading="$((10#$reading / 1000))"
+                if [ -z "$hottest" ] || [ "$reading" -gt "$hottest" ]; then
+                    hottest="$reading"
+                fi
+                ;;
+            *)
+                printf 'Unknown TEMP_SOURCE entry: %s\n' "$source" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    [ -n "$hottest" ] || return 1
+    printf '%s' "$hottest"
+}
+
+# Prints the index of the highest curve point at or below the temperature.
+level_for() {
+    local temp="$1"
+    local level=0
+    local i
+
+    for i in "${!curve_temps[@]}"; do
+        if [ "$temp" -ge "${curve_temps[$i]}" ]; then
+            level="$i"
+        fi
+    done
+    printf '%s' "$level"
+}
+
+# Each write takes the shared lock only for its duration, so one-shot
+# commands such as "nvfancontrol status" keep working while the daemon runs.
+locked_write_fan() {
+    local status=0
+
+    exec 9>"$lock_file"
+    flock 9 || return 1
+    write_fan "$1" || status=$?
+    exec 9>&-
+    return "$status"
+}
+
+exec 9>&-
+
+stop_requested=0
+on_signal() {
+    stop_requested=1
+}
+trap on_signal TERM INT HUP
+
+printf 'Curve: %s (hysteresis %s C, interval %s s, source: %s)\n' \
+    "$curve" "$hysteresis" "$interval" "$temp_source"
+
+level=''
+written=''
+while [ "$stop_requested" -eq 0 ]; do
+    if temp="$(read_temperature)"; then
+        up_level="$(level_for "$temp")"
+        if [ -z "$level" ] || [ "$up_level" -ge "$level" ]; then
+            level="$up_level"
+        else
+            # Step down only once the temperature has fallen HYSTERESIS
+            # degrees below the threshold of the current level.
+            down_level="$(level_for "$((temp + hysteresis))")"
+            if [ "$down_level" -lt "$level" ]; then
+                level="$down_level"
+            fi
+        fi
+        target="${curve_targets[$level]}"
+    else
+        temp='?'
+        target='max'
+    fi
+
+    if [ "$target" != "$written" ]; then
+        if [ "$temp" = '?' ]; then
+            printf 'No temperature reading available; failing safe to max\n'
+        else
+            printf 'Temperature %s C -> %s\n' "$temp" "$target"
+        fi
+        if ! locked_write_fan "$target"; then
+            printf 'Curve daemon stopping after a failed write; the EC keeps the last accepted value.\n' >&2
+            exit 1
+        fi
+        written="$target"
+    fi
+
+    sleep "$interval" &
+    wait $! || true
+done
+
+printf 'Stopping; restoring the EC automatic curve\n'
+locked_write_fan auto || exit 1
 printf 'OK\n'

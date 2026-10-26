@@ -6,5 +6,6 @@ Maintainer: 841973620 <admin@841973620.net>
 Depends: bash, kmod, make, gcc, util-linux
 Suggests: dkms
 Description: DGX Spark persistent EC fan sysfs controller
- The module exposes a fan sysfs attribute that accepts either
- the 100% fan override or the EC automatic thermal policy.
+ The module exposes a fan sysfs attribute that accepts the 100% fan
+ override, the EC automatic thermal policy, or an RPM floor. A helper
+ daemon can drive the RPM floor from a temperature curve.

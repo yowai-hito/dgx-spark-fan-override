@@ -12,7 +12,25 @@
 ```text
 /sys/bus/arm_ffa/devices/arm-ffa-17/fan
 ```
-每次向 `fan` 写入 `max` 或 `auto` 时发送一次请求，读取该属性会返回 `ready`、`max`、`auto` 或 `error <errno>`。
+每次向 `fan` 写入 `max`、`auto` 或 `0`–`13500` 的 RPM 数值时发送一次请求，读取该属性会返回 `ready`、`max`、`auto`、RPM 数值或 `error <errno>`。
+
+### 自定义风扇曲线
+
+数值与 `max` 写入同一个高端覆盖槽，因此作用是 RPM **下限**：EC 自动曲线在其之上仍然生效，自定义曲线只能让风扇比固件默认更快。
+
+```bash
+sudo nvfancontrol 6000      # 固定 6000 RPM 下限
+sudo nvfancontrol curve     # 前台运行 /etc/nvfancontrol.conf 中的曲线
+```
+
+`/etc/nvfancontrol.conf` 设置阶梯（`温度:目标`，目标为 `auto`、`max` 或 RPM）、降档回差、轮询间隔和温度来源（`thermal` 热区、`nvidia-smi` 或毫摄氏度文件路径）。守护进程仅在档位变化时写入；读不到温度时安全回退到 `max`；停止时恢复 `auto`。
+
+作为服务运行（会停止 `nvfancontrol.service`，反之亦然）：
+
+```bash
+sudo systemctl enable --now nvfancontrol-curve.service
+journalctl -u nvfancontrol-curve.service -f
+```
 
 --------
 

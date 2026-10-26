@@ -41,6 +41,14 @@ remove_manual_modules() {
 
 case "${1:-}" in
     remove|upgrade|deconfigure)
+        # Stop the curve daemon before taking the lock: on stop it restores
+        # auto, which needs both the lock and the loaded module.
+        if command -v systemctl >/dev/null 2>&1 &&
+           systemctl is-active --quiet nvfancontrol-curve.service; then
+            echo 'nvfancontrol: stopping nvfancontrol-curve.service'
+            systemctl stop nvfancontrol-curve.service || true
+        fi
+
         exec 9>/run/lock/nvfancontrol.lock
         flock 9
 

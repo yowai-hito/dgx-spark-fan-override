@@ -1,0 +1,11 @@
+[Unit]
+Description=nvfancontrol custom fan curve
+After=auditd.service
+Conflicts=nvfancontrol.service
+
+[Service]
+ExecStart=/usr/sbin/nvfancontrol curve
+Type=simple
+
+[Install]
+WantedBy=multi-user.target

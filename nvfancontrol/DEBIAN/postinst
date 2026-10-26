@@ -160,6 +160,7 @@ else
     echo "nvfancontrol: module installed for running kernel: $manual_module"
 fi
 
-echo "nvfancontrol: use 'sudo nvfancontrol max' or 'sudo nvfancontrol auto'"
+echo "nvfancontrol: use 'sudo nvfancontrol max', 'sudo nvfancontrol auto' or 'sudo nvfancontrol <rpm>'"
+echo "nvfancontrol: for a custom curve, edit /etc/nvfancontrol.conf and enable nvfancontrol-curve.service"
 
 exit 0
