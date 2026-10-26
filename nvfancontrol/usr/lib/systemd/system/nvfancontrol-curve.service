@@ -1,6 +1,6 @@
 [Unit]
 Description=nvfancontrol custom fan curve
-After=auditd.service
+After=auditd.service nvfancontrol.service
 Conflicts=nvfancontrol.service
 
 [Service]
