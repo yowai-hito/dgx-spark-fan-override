@@ -211,3 +211,33 @@ Service status:
 | `0` | Security service request completed |
 | `5` | Underlying status read, request write, or doorbell write failed; a duration of ~54 ms usually indicates a controller completion timeout |
 | `10` | EC mailbox status busy |
+
+### Setup
+
+On a fresh DGX Spark:
+
+```bash
+# 1. Install the build tools and headers for the running kernel
+sudo apt update
+sudo apt install -y git dkms linux-headers-$(uname -r)
+
+# 2. Get the code
+git clone https://github.com/yowai-hito/dgx-spark-fan-override.git
+cd dgx-spark-fan-override
+
+# 3. Build and install the package (apt also installs its dependencies)
+dpkg-deb --root-owner-group --build nvfancontrol nvfancontrol_1.0.0_arm64.deb
+sudo apt install ./nvfancontrol_1.0.0_arm64.deb
+
+# 4. Optional: adjust the curve first
+sudo nano /etc/nvfancontrol.conf
+
+# 5. Start the curve now and at every boot
+sudo systemctl enable --now nvfancontrol-curve.service
+
+# 6. Check
+sudo nvfancontrol status                # Module: loaded / Fan: <rpm> / Curve: running (PID ...)
+journalctl -t nvfancontrol-curve -f     # e.g. "Temperature 52 C -> 5500"
+```
+
+The install in step 3 should end with `nvfancontrol: DKMS module installed for running kernel`. From then on, switch between full speed and the curve with `sudo nvfancontrol max` and `sudo nvfancontrol curve`.

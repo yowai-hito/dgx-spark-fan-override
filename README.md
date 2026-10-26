@@ -213,3 +213,34 @@ OEM1 command 17 的共享页布局：
 | `0` | 安全服务完成请求 |
 | `5` | 底层状态读、请求写或门铃写失败；约 54 ms 时通常是 controller completion 超时 |
 | `10` | EC mailbox 状态忙 |
+
+### 设置步骤
+
+在全新的 DGX Spark 上：
+
+```bash
+# 1. 安装构建工具和当前运行内核的头文件
+sudo apt update
+sudo apt install -y git dkms linux-headers-$(uname -r)
+
+# 2. 获取代码
+git clone https://github.com/yowai-hito/dgx-spark-fan-override.git
+cd dgx-spark-fan-override
+
+# 3. 构建并安装软件包（apt 会同时安装其依赖）
+dpkg-deb --root-owner-group --build nvfancontrol nvfancontrol_1.0.0_arm64.deb
+sudo apt install ./nvfancontrol_1.0.0_arm64.deb
+
+# 4. 可选：先调整曲线
+sudo nano /etc/nvfancontrol.conf
+
+# 5. 立即启动曲线，并设为开机自动启动
+sudo systemctl enable --now nvfancontrol-curve.service
+
+# 6. 检查
+sudo nvfancontrol status                # Module: loaded / Fan: <rpm> / Curve: running (PID ...)
+journalctl -t nvfancontrol-curve -f     # 例如 "Temperature 52 C -> 5500"
+```
+
+第 3 步的安装输出应以 `nvfancontrol: DKMS module installed for running kernel` 结尾。之后可用 `sudo nvfancontrol max` 和 `sudo nvfancontrol curve` 在全速与曲线之间切换。
+
