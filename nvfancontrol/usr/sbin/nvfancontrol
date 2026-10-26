@@ -8,17 +8,20 @@ fan_path="$ffa_device/fan"
 module='nvfancontrol'
 lock_file='/run/lock/nvfancontrol.lock'
 curve_lock_file='/run/lock/nvfancontrol-curve.lock'
+curve_pid_file='/run/nvfancontrol-curve.pid'
+curve_log_tag='nvfancontrol-curve'
 config_file='/etc/nvfancontrol.conf'
 full_rpm=13500
 
 usage() {
     printf 'Usage: sudo nvfancontrol {max|auto|<rpm>|curve|status|unload}\n' >&2
-    printf '  max      load the module if needed, then write max to the fan sysfs interface\n' >&2
-    printf '  auto     load the module if needed, then write auto to the fan sysfs interface\n' >&2
-    printf '  <rpm>    load the module if needed, then set a fixed RPM floor (0-%s)\n' "$full_rpm" >&2
-    printf '  curve    run the temperature curve from %s until stopped, then restore auto\n' "$config_file" >&2
-    printf '  status   show whether the module is loaded and read the fan interface\n' >&2
-    printf '  unload   explicitly remove the module; the EC setting remains unchanged\n' >&2
+    printf '  max      set the fans to 100%% (stops a running curve first)\n' >&2
+    printf '  auto     restore the EC automatic curve (stops a running curve first)\n' >&2
+    printf '  <rpm>    set a fixed RPM floor 0-%s (stops a running curve first)\n' "$full_rpm" >&2
+    printf '  curve    start the curve from %s in the background, replacing\n' "$config_file" >&2
+    printf '           any running curve; logs: journalctl -t %s -f\n' "$curve_log_tag" >&2
+    printf '  status   show the module, fan and curve state\n' >&2
+    printf '  unload   stop any running curve and remove the module; the EC setting remains unchanged\n' >&2
 }
 
 # Normalizes a fan target to the form the sysfs attribute reports back:
@@ -39,9 +42,33 @@ normalize_target() {
     esac
 }
 
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+# "curve --foreground" runs the daemon loop in this process; it is what the
+# background launcher and nvfancontrol-curve.service execute.
+foreground=0
 case "${1:-}" in
-    status|unload|curve)
+    status|unload)
         action="$1"
+        ;;
+    curve)
+        action='curve'
+        case "${2:-}" in
+            '')
+                ;;
+            --foreground)
+                foreground=1
+                ;;
+            *)
+                usage
+                exit 2
+                ;;
+        esac
         ;;
     -h|--help)
         usage
@@ -59,17 +86,191 @@ module_is_loaded() {
     grep -q "^${module} " /proc/modules 2>/dev/null
 }
 
+# Prints the PID of the running curve daemon, if the PID file names a live
+# nvfancontrol curve process.
+curve_pid() {
+    local pid
+
+    pid="$(tr -dc '0-9' 2>/dev/null < "$curve_pid_file" || true)"
+    [ -n "$pid" ] || return 1
+    case "$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" || true)" in
+        *nvfancontrol*curve*)
+            printf '%s' "$pid"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Stops a running curve daemon without restoring auto, because the caller is
+# about to write its own target. On success this process holds the curve lock
+# on fd 8, so no other curve can start until it exits or closes fd 8.
+stop_curve() {
+    local pid=''
+
+    exec 8>"$curve_lock_file"
+    if flock -n 8; then
+        return 0
+    fi
+
+    # The lock holder may still be starting up and not have written its PID.
+    for _ in {1..50}; do
+        if pid="$(curve_pid)"; then
+            break
+        fi
+        pid=''
+        sleep 0.1
+    done
+    if [ -z "$pid" ]; then
+        printf 'A curve daemon holds %s but its PID could not be found.\n' \
+            "$curve_lock_file" >&2
+        return 1
+    fi
+
+    kill -USR1 "$pid" 2>/dev/null || true
+    if ! flock -w 30 8; then
+        printf 'The running curve (PID %s) did not stop within 30 s.\n' "$pid" >&2
+        return 1
+    fi
+    printf 'Stopped the running curve (PID %s).\n' "$pid"
+}
+
+# ---------------------------------------------------------------------------
+# Custom temperature curve configuration
+#
+# The EC high override slot is an RPM floor: the EC automatic curve still
+# applies above it. The curve therefore can only make the fans spin faster
+# than the firmware would on its own, never slower.
+# ---------------------------------------------------------------------------
+
+interval=2
+hysteresis=5
+temp_source='thermal'
+curve='0:2000 35:3000 40:3500 50:5500 58:6250 65:7000 70:9000 85:11000 90:12000 95:13500'
+
+# The configuration is parsed rather than sourced so that it can never execute
+# code as root.
+load_curve_config() {
+    local line key value source point point_temp point_target
+
+    if [ -e "$config_file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%%#*}"
+            line="$(trim "${line%$'\r'}")"
+            [ -n "$line" ] || continue
+            case "$line" in
+                *=*)
+                    ;;
+                *)
+                    printf 'Invalid line in %s: %s\n' "$config_file" "$line" >&2
+                    exit 1
+                    ;;
+            esac
+            key="$(trim "${line%%=*}")"
+            value="$(trim "${line#*=}")"
+            value="${value#[\"\']}"
+            value="${value%[\"\']}"
+            case "$key" in
+                INTERVAL) interval="$value" ;;
+                HYSTERESIS) hysteresis="$value" ;;
+                TEMP_SOURCE) temp_source="$value" ;;
+                CURVE) curve="$value" ;;
+                *)
+                    printf 'Unknown key in %s: %s\n' "$config_file" "$key" >&2
+                    exit 1
+                    ;;
+            esac
+        done < "$config_file"
+    fi
+
+    case "$interval" in
+        ''|*[!0-9]*|0)
+            printf 'INTERVAL must be a positive integer number of seconds: %s\n' "$interval" >&2
+            exit 1
+            ;;
+    esac
+    case "$hysteresis" in
+        ''|*[!0-9]*)
+            printf 'HYSTERESIS must be a non-negative integer in degrees C: %s\n' "$hysteresis" >&2
+            exit 1
+            ;;
+    esac
+    for source in $temp_source; do
+        case "$source" in
+            thermal|nvidia-smi|/*)
+                ;;
+            *)
+                printf 'TEMP_SOURCE entries must be thermal, nvidia-smi or an absolute path: %s\n' \
+                    "$source" >&2
+                exit 1
+                ;;
+        esac
+    done
+    if [ -z "$(trim "$temp_source")" ]; then
+        printf 'TEMP_SOURCE is empty in %s\n' "$config_file" >&2
+        exit 1
+    fi
+
+    curve_temps=()
+    curve_targets=()
+    for point in $curve; do
+        point_temp="${point%%:*}"
+        point_target="${point#*:}"
+        case "$point_temp" in
+            ''|*[!0-9]*)
+                printf 'Invalid curve point (expected TEMP:RPM): %s\n' "$point" >&2
+                exit 1
+                ;;
+        esac
+        if [ "$point" = "$point_temp" ] ||
+                ! point_target="$(normalize_target "$point_target")"; then
+            printf 'Invalid curve target in %s (expected auto, max or 0-%s)\n' \
+                "$point" "$full_rpm" >&2
+            exit 1
+        fi
+        point_temp="$((10#$point_temp))"
+        if [ "${#curve_temps[@]}" -gt 0 ] &&
+                [ "$point_temp" -le "${curve_temps[-1]}" ]; then
+            printf 'Curve temperatures must be strictly increasing: %s\n' "$curve" >&2
+            exit 1
+        fi
+        curve_temps+=("$point_temp")
+        curve_targets+=("$point_target")
+    done
+
+    if [ "${#curve_temps[@]}" -eq 0 ]; then
+        printf 'CURVE is empty in %s\n' "$config_file" >&2
+        exit 1
+    fi
+}
+
 if [ "$(id -u)" -ne 0 ]; then
     printf 'Run this command as root.\n' >&2
     exit 1
 fi
 
+# Validate before touching a running curve, so a broken config never stops a
+# working one.
 if [ "$action" = 'curve' ]; then
-    exec 8>"$curve_lock_file"
-    if ! flock -n 8; then
-        printf 'Another nvfancontrol curve daemon is already running.\n' >&2
-        exit 1
-    fi
+    load_curve_config
+fi
+
+# Any command that writes the fan or removes the module takes over from a
+# running curve. This must happen before taking the main lock, which the
+# curve daemon needs to finish an in-flight write.
+if [ "$action" != 'status' ]; then
+    stop_curve || exit 1
+fi
+
+if [ "$action" = 'curve' ] && [ "$foreground" -eq 1 ]; then
+    # TERM/INT/HUP (systemctl stop, Ctrl+C, pkill) restore auto on exit;
+    # USR1 comes from another nvfancontrol command that writes its own target.
+    stop_mode=''
+    trap 'stop_mode=restore' TERM INT HUP
+    trap 'stop_mode=handoff' USR1
+    trap 'rm -f -- "$curve_pid_file"' EXIT
+    printf '%s\n' "$$" > "$curve_pid_file"
 fi
 
 exec 9>"$lock_file"
@@ -114,6 +315,11 @@ if [ "$action" = 'status' ]; then
     printf 'Module: loaded\n'
     printf 'Driver: %s\n' "$(readlink "$ffa_device/driver")"
     printf 'Fan: %s\n' "$(tr -d '\r\n' < "$fan_path")"
+    if pid="$(curve_pid)"; then
+        printf 'Curve: running (PID %s)\n' "$pid"
+    else
+        printf 'Curve: stopped\n'
+    fi
     exit 0
 fi
 
@@ -201,117 +407,36 @@ if [ "$action" != 'curve' ]; then
     exit 0
 fi
 
+if [ "$foreground" -eq 0 ]; then
+    # Start the daemon in its own session so it survives the terminal (and
+    # sudo's pty) closing. It must not inherit the locks held here.
+    self="$(readlink -f "$0")"
+    exec 8>&- 9>&-
+    if command -v systemd-cat >/dev/null 2>&1; then
+        setsid -f systemd-cat -t "$curve_log_tag" "$self" curve --foreground \
+            < /dev/null
+        log_hint="journalctl -t $curve_log_tag -f"
+    else
+        setsid -f "$self" curve --foreground \
+            < /dev/null >> "/var/log/$curve_log_tag.log" 2>&1
+        log_hint="tail -f /var/log/$curve_log_tag.log"
+    fi
+
+    for _ in {1..50}; do
+        if pid="$(curve_pid)"; then
+            printf 'Curve running in the background (PID %s). Logs: %s\n' \
+                "$pid" "$log_hint"
+            exit 0
+        fi
+        sleep 0.1
+    done
+    printf 'The curve daemon did not start. Check: %s\n' "$log_hint" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Custom temperature curve daemon
-#
-# The EC high override slot is an RPM floor: the EC automatic curve still
-# applies above it. The daemon therefore can only make the fans spin faster
-# than the firmware would on its own, never slower.
 # ---------------------------------------------------------------------------
-
-interval=2
-hysteresis=5
-temp_source='thermal'
-curve='0:2000 40:3500 50:5500 58:6250 65:7000 70:9000 85:max'
-
-trim() {
-    local value="$1"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    printf '%s' "$value"
-}
-
-# The configuration is parsed rather than sourced so that it can never execute
-# code as root.
-if [ -e "$config_file" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%%#*}"
-        line="$(trim "${line%$'\r'}")"
-        [ -n "$line" ] || continue
-        case "$line" in
-            *=*)
-                ;;
-            *)
-                printf 'Invalid line in %s: %s\n' "$config_file" "$line" >&2
-                exit 1
-                ;;
-        esac
-        key="$(trim "${line%%=*}")"
-        value="$(trim "${line#*=}")"
-        value="${value#[\"\']}"
-        value="${value%[\"\']}"
-        case "$key" in
-            INTERVAL) interval="$value" ;;
-            HYSTERESIS) hysteresis="$value" ;;
-            TEMP_SOURCE) temp_source="$value" ;;
-            CURVE) curve="$value" ;;
-            *)
-                printf 'Unknown key in %s: %s\n' "$config_file" "$key" >&2
-                exit 1
-                ;;
-        esac
-    done < "$config_file"
-fi
-
-case "$interval" in
-    ''|*[!0-9]*|0)
-        printf 'INTERVAL must be a positive integer number of seconds: %s\n' "$interval" >&2
-        exit 1
-        ;;
-esac
-case "$hysteresis" in
-    ''|*[!0-9]*)
-        printf 'HYSTERESIS must be a non-negative integer in degrees C: %s\n' "$hysteresis" >&2
-        exit 1
-        ;;
-esac
-for source in $temp_source; do
-    case "$source" in
-        thermal|nvidia-smi|/*)
-            ;;
-        *)
-            printf 'TEMP_SOURCE entries must be thermal, nvidia-smi or an absolute path: %s\n' \
-                "$source" >&2
-            exit 1
-            ;;
-    esac
-done
-if [ -z "$(trim "$temp_source")" ]; then
-    printf 'TEMP_SOURCE is empty in %s\n' "$config_file" >&2
-    exit 1
-fi
-
-curve_temps=()
-curve_targets=()
-for point in $curve; do
-    point_temp="${point%%:*}"
-    point_target="${point#*:}"
-    case "$point_temp" in
-        ''|*[!0-9]*)
-            printf 'Invalid curve point (expected TEMP:RPM): %s\n' "$point" >&2
-            exit 1
-            ;;
-    esac
-    if [ "$point" = "$point_temp" ] ||
-            ! point_target="$(normalize_target "$point_target")"; then
-        printf 'Invalid curve target in %s (expected auto, max or 0-%s)\n' \
-            "$point" "$full_rpm" >&2
-        exit 1
-    fi
-    point_temp="$((10#$point_temp))"
-    if [ "${#curve_temps[@]}" -gt 0 ] &&
-            [ "$point_temp" -le "${curve_temps[-1]}" ]; then
-        printf 'Curve temperatures must be strictly increasing: %s\n' "$curve" >&2
-        exit 1
-    fi
-    curve_temps+=("$point_temp")
-    curve_targets+=("$point_target")
-done
-
-if [ "${#curve_temps[@]}" -eq 0 ]; then
-    printf 'CURVE is empty in %s\n' "$config_file" >&2
-    exit 1
-fi
 
 # Prints the hottest reading in whole degrees C across all configured sources.
 read_temperature() {
@@ -396,18 +521,12 @@ locked_write_fan() {
 
 exec 9>&-
 
-stop_requested=0
-on_signal() {
-    stop_requested=1
-}
-trap on_signal TERM INT HUP
-
 printf 'Curve: %s (hysteresis %s C, interval %s s, source: %s)\n' \
     "$curve" "$hysteresis" "$interval" "$temp_source"
 
 level=''
 written=''
-while [ "$stop_requested" -eq 0 ]; do
+while [ -z "$stop_mode" ]; do
     if temp="$(read_temperature)"; then
         up_level="$(level_for "$temp")"
         if [ -z "$level" ] || [ "$up_level" -ge "$level" ]; then
@@ -439,9 +558,15 @@ while [ "$stop_requested" -eq 0 ]; do
         written="$target"
     fi
 
-    sleep "$interval" &
+    # The sleep must not inherit the curve lock, or it would outlive a stop.
+    sleep "$interval" 8>&- &
     wait $! || true
 done
+
+if [ "$stop_mode" = 'handoff' ]; then
+    printf 'Stopping; another nvfancontrol command is taking over\n'
+    exit 0
+fi
 
 printf 'Stopping; restoring the EC automatic curve\n'
 locked_write_fan auto || exit 1

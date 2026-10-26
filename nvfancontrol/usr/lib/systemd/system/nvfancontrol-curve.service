@@ -4,8 +4,9 @@ After=auditd.service nvfancontrol.service
 Conflicts=nvfancontrol.service
 
 [Service]
-ExecStart=/usr/sbin/nvfancontrol curve
+ExecStart=/usr/sbin/nvfancontrol curve --foreground
 Type=simple
+SyslogIdentifier=nvfancontrol-curve
 
 [Install]
 WantedBy=multi-user.target

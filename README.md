@@ -19,17 +19,21 @@
 数值与 `max` 写入同一个高端覆盖槽，因此作用是 RPM **下限**：EC 自动曲线在其之上仍然生效，自定义曲线只能让风扇比固件默认更快。
 
 ```bash
-sudo nvfancontrol 6000      # 固定 6000 RPM 下限
-sudo nvfancontrol curve     # 前台运行 /etc/nvfancontrol.conf 中的曲线
+sudo nvfancontrol curve     # 在后台启动 /etc/nvfancontrol.conf 中的曲线
+sudo nvfancontrol max       # 停止曲线并全速
+sudo nvfancontrol curve     # 恢复曲线
+sudo nvfancontrol 6000      # 停止曲线并固定 6000 RPM 下限
+sudo nvfancontrol auto      # 停止曲线并恢复 EC 自动曲线
+sudo nvfancontrol status    # 显示 "Curve: running (PID ...)" 或 "Curve: stopped"
+journalctl -t nvfancontrol-curve -f
 ```
 
-`/etc/nvfancontrol.conf` 设置阶梯（`温度:目标`，目标为 `auto`、`max` 或 RPM）、降档回差、轮询间隔和温度来源（`thermal` 热区、`nvidia-smi` 或毫摄氏度文件路径）。守护进程仅在档位变化时写入；读不到温度时安全回退到 `max`；停止时恢复 `auto`。
+`/etc/nvfancontrol.conf` 设置阶梯（`温度:目标`，目标为 `auto`、`max` 或 RPM）、降档回差、轮询间隔和温度来源（`thermal` 热区、`nvidia-smi` 或毫摄氏度文件路径）。守护进程仅在档位变化时写入；读不到温度时安全回退到 `max`。`max`、`auto`、RPM 数值或 `unload` 会直接接管正在运行的曲线。再次执行 `curve` 会按当前配置重启曲线；配置无效时不会影响正在运行的曲线。以其他方式停止曲线（`pkill`、对 `curve --foreground` 按 Ctrl+C、`systemctl stop`）会恢复 `auto`。
 
-作为服务运行（会停止 `nvfancontrol.service`，反之亦然）：
+开机自动启动曲线（会停止 `nvfancontrol.service`，反之亦然）：
 
 ```bash
 sudo systemctl enable --now nvfancontrol-curve.service
-journalctl -u nvfancontrol-curve.service -f
 ```
 
 --------

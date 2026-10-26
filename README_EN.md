@@ -19,17 +19,21 @@ A request is sent each time `max`, `auto`, or an RPM value `0`–`13500` is writ
 A numeric value is written to the same high override slot as `max`, so it acts as an RPM **floor**: the EC automatic curve still applies above it, and a custom curve can only make the fans faster than the firmware would.
 
 ```bash
-sudo nvfancontrol 6000      # fixed 6000 RPM floor
-sudo nvfancontrol curve     # run the curve from /etc/nvfancontrol.conf in the foreground
+sudo nvfancontrol curve     # start the curve from /etc/nvfancontrol.conf in the background
+sudo nvfancontrol max       # stop the curve and go to 100%
+sudo nvfancontrol curve     # back to the curve
+sudo nvfancontrol 6000      # stop the curve and hold a fixed 6000 RPM floor
+sudo nvfancontrol auto      # stop the curve and return to the EC curve
+sudo nvfancontrol status    # shows "Curve: running (PID ...)" or "Curve: stopped"
+journalctl -t nvfancontrol-curve -f
 ```
 
-`/etc/nvfancontrol.conf` sets the steps (`TEMP:TARGET`, where TARGET is `auto`, `max`, or an RPM), the step-down hysteresis, the poll interval, and the temperature source (`thermal` zones, `nvidia-smi`, or a millidegree file path). The daemon writes only when the step changes. If no temperature can be read it fails safe to `max`, and it restores `auto` when stopped.
+`/etc/nvfancontrol.conf` sets the steps (`TEMP:TARGET`, where TARGET is `auto`, `max`, or an RPM), the step-down hysteresis, the poll interval, and the temperature source (`thermal` zones, `nvidia-smi`, or a millidegree file path). The daemon writes only when the step changes, and it fails safe to `max` if no temperature can be read. `max`, `auto`, an RPM value, or `unload` replace a running curve directly. Running `curve` again restarts it with the current config; if the config is invalid, the running curve is left alone. Stopping the curve any other way (`pkill`, Ctrl+C on `curve --foreground`, `systemctl stop`) restores `auto`.
 
-Run it as a service (this stops `nvfancontrol.service`, and the reverse is also true):
+To start the curve at boot, enable the service (this stops `nvfancontrol.service`, and the reverse is also true):
 
 ```bash
 sudo systemctl enable --now nvfancontrol-curve.service
-journalctl -u nvfancontrol-curve.service -f
 ```
 
 --------
